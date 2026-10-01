@@ -137,7 +137,7 @@ def scan_directory(directory, recursive=False):
 class FileListViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("文件列表查看器")
+        self.root.title("DirLens · 文件列表查看器")
         self.root.geometry("1000x600")
         self.root.resizable(True, True)
         
