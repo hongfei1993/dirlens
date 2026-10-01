@@ -59,7 +59,7 @@ Windows 原生并没有「把当前文件夹里的文件名一次性导出成清
 ## 从源码运行
 
 ```bash
-git clone <你的仓库地址>
+git clone https://github.com/hongfei1993/dirlens.git
 cd dirlens
 pip install -r requirements.txt
 python app.py
