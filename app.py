@@ -1,11 +1,23 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+import re
 import sys
 import pyperclip
 
 # 导入ScrolledText组件
 from tkinter.scrolledtext import ScrolledText
+
+
+def natural_sort_key(text):
+    """自然排序键：把字符串中的数字段按数值比较，使 file2 排在 file10 之前。
+
+    re.split 保留捕获组后，结果中非数字段与数字段的位置是固定的（下标奇偶性不变），
+    因此同一位置上比较的两个元素类型始终一致，不会出现 str 与 int 相比的报错。
+    """
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r'(\d+)', text)]
+
 
 class FileListViewer:
     def __init__(self, root):
@@ -187,6 +199,9 @@ class FileListViewer:
     
     def _load_file_list(self, directory):
         try:
+            # 记录当前目录（手工输入路径走这里时也要同步，否则复制/导出会被误拦）
+            self.current_directory = directory
+
             # 获取目录内容
             items = os.listdir(directory)
             
@@ -250,14 +265,14 @@ class FileListViewer:
         
         # 应用文件类型过滤
         filtered_files = self._filter_by_extension(self.filenames)
-        
-        # 排序
-        filtered_files.sort(reverse=reverse)
-        
+
+        # 排序（自然排序：file2 排在 file10 之前）
+        filtered_files.sort(key=natural_sort_key, reverse=reverse)
+
         # 如果需要显示文件夹
         if self.show_folders:
             # 排序文件夹
-            sorted_folders = sorted(self.folder_names, reverse=reverse)
+            sorted_folders = sorted(self.folder_names, key=natural_sort_key, reverse=reverse)
             # 文件夹和文件分开显示
             return sorted_folders + filtered_files
         else:
@@ -289,9 +304,20 @@ class FileListViewer:
         if directory and os.path.isdir(directory):
             self._load_file_list(directory)
     
+    def _get_current_directory(self):
+        """实时从输入框取目录，作为复制/导出的唯一校验来源。
+
+        不能只依赖 self.current_directory：用户手工在输入框粘贴路径后回车时
+        列表能正常加载，若该属性未同步就会把复制/导出误判为「未选择目录」。
+        """
+        directory = self.directory_var.get().strip()
+        if directory and os.path.isdir(directory):
+            return directory
+        return None
+
     def _copy_all_filenames(self):
         try:
-            if not self.current_directory or not os.path.isdir(self.current_directory):
+            if not self._get_current_directory():
                 messagebox.showerror("错误", "请先选择有效的目录")
                 return
             
@@ -313,7 +339,7 @@ class FileListViewer:
             messagebox.showerror("错误", f"复制时出错：{str(e)}")
     
     def _export_to_text(self):
-        if not self.current_directory or not os.path.isdir(self.current_directory):
+        if not self._get_current_directory():
             messagebox.showerror("错误", "请先选择有效的目录")
             return
         
@@ -336,7 +362,9 @@ class FileListViewer:
                 return  # 用户取消选择
             
             # 写入项目到文件
-            with open(file_path, 'w', encoding='utf-8') as f:
+            # 用 utf-8-sig（带 BOM）：国内用户多用 Excel/WPS 双击打开导出的 txt，
+            # 无 BOM 的 UTF-8 会被识别成 ANSI，导致中文文件名乱码
+            with open(file_path, 'w', encoding='utf-8-sig') as f:
                 for item in items_to_export:
                     f.write(item + "\n")
             
