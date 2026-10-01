@@ -19,6 +19,51 @@ def natural_sort_key(text):
             for part in re.split(r'(\d+)', text)]
 
 
+def scan_directory(directory):
+    """扫描目录，返回 (文件记录列表, 文件夹记录列表)。
+
+    用 os.scandir 而不是 os.listdir：Windows 上 is_file()/is_dir() 直接取自
+    目录项缓存，比 listdir + os.path.isfile 少一轮系统调用；且 entry.stat()
+    能一次拿到大小与修改时间，避免后续为每个文件重复 stat。
+
+    每条记录的结构：
+        name   文件名（含扩展名）
+        stem   主名（不含扩展名）
+        ext    扩展名（小写、无点号，无扩展名时为空串）
+        path   绝对/完整路径
+        size   字节数
+        mtime  修改时间戳
+    """
+    files, dirs = [], []
+
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                try:
+                    st = entry.stat()
+                    name = entry.name
+                    stem, ext = os.path.splitext(name)
+                    is_dir = entry.is_dir()
+                    rec = {
+                        "name": name,
+                        "stem": stem,
+                        "ext": ext[1:].lower(),
+                        "path": entry.path,
+                        "size": st.st_size,
+                        "mtime": st.st_mtime,
+                    }
+                except OSError:
+                    # 权限不足、文件被占用或扫描期间已被删除：跳过这一项，
+                    # 不要让整个目录的扫描中断
+                    continue
+                (dirs if is_dir else files).append(rec)
+    except OSError:
+        # 目录本身不可读（如无权限）时返回空结果，由上层提示
+        pass
+
+    return files, dirs
+
+
 class FileListViewer:
     def __init__(self, root):
         self.root = root
@@ -31,10 +76,12 @@ class FileListViewer:
         
         # 当前选中的目录
         self.current_directory = ""
-        self.filenames = []  # 存储纯文件名列表
-        self.folder_names = []  # 存储文件夹名列表
-        self.all_items = []  # 存储所有项目（文件和文件夹）
-        self.file_extensions = []  # 存储文件扩展名列表
+        # 文件 / 文件夹记录列表。改存字典记录（而不是纯文件名字符串），是为了让
+        # 大小、修改时间、完整路径等属性随扫描一次性取回；后续的字段展示、
+        # 递归扫描、多字段导出都依赖这个结构。
+        self.files = []
+        self.dirs = []
+        self.file_extensions = set()  # 当前目录出现过的扩展名（小写、无点号）
         self.show_folders = False  # 是否显示文件夹
         
         # 创建主框架
@@ -202,26 +249,10 @@ class FileListViewer:
             # 记录当前目录（手工输入路径走这里时也要同步，否则复制/导出会被误拦）
             self.current_directory = directory
 
-            # 获取目录内容
-            items = os.listdir(directory)
-            
-            # 清空列表
-            self.filenames = []
-            self.folder_names = []
-            self.file_extensions = set()
-            
-            # 分类存储文件和文件夹
-            for item in items:
-                item_path = os.path.join(directory, item)
-                if os.path.isfile(item_path):
-                    self.filenames.append(item)
-                    # 获取文件扩展名
-                    _, ext = os.path.splitext(item)
-                    if ext:
-                        self.file_extensions.add(ext[1:])  # 去掉点号
-                elif os.path.isdir(item_path):
-                    self.folder_names.append(item)
-            
+            # 扫描目录，一次性取回文件与文件夹记录（含大小、修改时间、完整路径）
+            self.files, self.dirs = scan_directory(directory)
+            self.file_extensions = {r["ext"] for r in self.files if r["ext"]}
+
             # 更新文件类型下拉菜单
             if hasattr(self, 'filter_combo'):
                 extensions = sorted(self.file_extensions)
@@ -241,14 +272,14 @@ class FileListViewer:
             
             # 显示项目
             if items_to_display:
-                for item in items_to_display:
-                    self.file_list_text.insert(tk.END, item + "\n")
+                for rec in items_to_display:
+                    self.file_list_text.insert(tk.END, self._item_text(rec) + "\n")
                 # 更新状态
-                total_count = len(self.filenames) + (len(self.folder_names) if self.show_folders else 0)
+                total_count = len(self.files) + (len(self.dirs) if self.show_folders else 0)
                 self.status_var.set(f"找到 {total_count} 个项目")
             else:
                 self.file_list_text.insert(tk.END, "没有找到符合条件的项目")
-                total_count = len(self.filenames) + (len(self.folder_names) if self.show_folders else 0)
+                total_count = len(self.files) + (len(self.dirs) if self.show_folders else 0)
                 self.status_var.set(f"找到 {total_count} 个项目，过滤后显示 0 个")
             
             self.file_list_text.config(state=tk.DISABLED)
@@ -258,38 +289,45 @@ class FileListViewer:
             self.status_var.set("加载失败")
     
     def _get_items_to_display(self):
-        """获取需要显示的项目列表"""
+        """获取需要显示 / 输出、且已按当前排序与过滤条件处理好的记录列表"""
         # 获取排序顺序
         sort_order = self.sort_var.get() if hasattr(self, 'sort_var') else "升序"
         reverse = (sort_order == "降序")
-        
+
         # 应用文件类型过滤
-        filtered_files = self._filter_by_extension(self.filenames)
+        filtered_files = self._filter_by_extension(self.files)
 
         # 排序（自然排序：file2 排在 file10 之前）
-        filtered_files.sort(key=natural_sort_key, reverse=reverse)
+        filtered_files.sort(key=lambda r: natural_sort_key(r["name"]), reverse=reverse)
 
         # 如果需要显示文件夹
         if self.show_folders:
-            # 排序文件夹
-            sorted_folders = sorted(self.folder_names, key=natural_sort_key, reverse=reverse)
+            sorted_dirs = sorted(self.dirs,
+                                 key=lambda r: natural_sort_key(r["name"]),
+                                 reverse=reverse)
             # 文件夹和文件分开显示
-            return sorted_folders + filtered_files
+            return sorted_dirs + filtered_files
         else:
             return filtered_files
-    
-    def _filter_by_extension(self, filenames):
-        """根据文件类型过滤文件"""
+
+    def _filter_by_extension(self, records):
+        """按扩展名过滤文件记录"""
         if not hasattr(self, 'filter_var'):
-            return filenames
-            
+            return records
+
         selected_type = self.filter_var.get()
         if selected_type == "所有文件":
-            return filenames
-            
-        # 过滤特定扩展名的文件
-        return [filename for filename in filenames 
-                if os.path.splitext(filename)[1].lower() == f".{selected_type.lower()}"]
+            return records
+
+        target = selected_type.lower()
+        return [r for r in records if r["ext"] == target]
+
+    def _item_text(self, rec):
+        """单个条目在当前设置下的输出文本。
+
+        显示、复制、导出三处共用；后续加入「完整路径」等字段时改这里即可。
+        """
+        return rec["name"]
     
     def _apply_filter(self):
         """应用过滤条件"""
@@ -329,7 +367,7 @@ class FileListViewer:
                 return
             
             # 生成所有项目的文本
-            items_text = "\n".join(items_to_copy)
+            items_text = "\n".join(self._item_text(rec) for rec in items_to_copy)
             pyperclip.copy(items_text)
             
             item_type = "文件名和文件夹" if self.show_folders else "文件名"
@@ -365,8 +403,8 @@ class FileListViewer:
             # 用 utf-8-sig（带 BOM）：国内用户多用 Excel/WPS 双击打开导出的 txt，
             # 无 BOM 的 UTF-8 会被识别成 ANSI，导致中文文件名乱码
             with open(file_path, 'w', encoding='utf-8-sig') as f:
-                for item in items_to_export:
-                    f.write(item + "\n")
+                for rec in items_to_export:
+                    f.write(self._item_text(rec) + "\n")
             
             item_type = "文件名和文件夹" if self.show_folders else "文件名"
             messagebox.showinfo("成功", f"已成功导出 {len(items_to_export)} 个{item_type}到文件\n{file_path}")
