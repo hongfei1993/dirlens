@@ -192,6 +192,18 @@ class FileListViewer:
         refresh_btn.pack(side=tk.LEFT, padx=5)
     
     def _create_file_list_section(self):
+        # 状态栏必须先于列表区 pack，并固定在底部。
+        # Tk 的 pack 在空间不足时会把【最后】pack 的控件压成 0 高度，
+        # 而列表区带 expand=True 会吃掉剩余空间 —— 顺序反了状态栏就会消失。
+        status_label = ttk.Label(self.main_frame,
+                                 textvariable=self.status_var,
+                                 relief=tk.FLAT,
+                                 anchor=tk.W,
+                                 padding=(10, 5),
+                                 background="#E0E0E0",
+                                 font=("Microsoft YaHei UI", 9))
+        status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
+
         list_frame = ttk.LabelFrame(self.main_frame, text="文件列表", padding="10")
         list_frame.pack(fill=tk.BOTH, expand=True, pady=5, ipady=5)
         
@@ -214,16 +226,8 @@ class FileListViewer:
         
         
         
-        # 添加状态标签
-        status_label = ttk.Label(self.main_frame, 
-                                textvariable=self.status_var, 
-                                relief=tk.FLAT,
-                                anchor=tk.W,
-                                padding=(10, 5),
-                                background="#E0E0E0",
-                                font=("Microsoft YaHei UI", 9))
-        status_label.pack(fill=tk.X, pady=(5, 0))
-    
+        # 状态栏已在本方法开头创建并固定到底部（必须先于列表区 pack）
+
     def _create_actions_section(self):
         # 创建一个标签框架，使按钮区域更明显
         actions_frame = ttk.LabelFrame(self.main_frame, text="操作", padding="10")
