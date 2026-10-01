@@ -48,8 +48,11 @@ def format_mtime(timestamp):
         return "-"
 
 
-def scan_directory(directory):
+def scan_directory(directory, recursive=False):
     """扫描目录，返回 (文件记录列表, 文件夹记录列表)。
+
+    recursive=True 时遍历所有层级；此时**不收集文件夹**——深层文件夹会把列表
+    淹没，而每个文件在树中的位置已由 rel（相对路径）体现。
 
     用 os.scandir 而不是 os.listdir：Windows 上 is_file()/is_dir() 直接取自
     目录项缓存，比 listdir + os.path.isfile 少一轮系统调用；且 entry.stat()
@@ -60,36 +63,57 @@ def scan_directory(directory):
         stem   主名（不含扩展名）
         ext    扩展名（小写、无点号，无扩展名时为空串）
         path   绝对/完整路径
+        rel    相对所选根目录的路径（递归时用于区分不同层级的同名文件）
         size   字节数
         mtime  修改时间戳
     """
     files, dirs = [], []
 
-    try:
-        with os.scandir(directory) as it:
-            for entry in it:
-                try:
-                    st = entry.stat()
-                    name = entry.name
-                    stem, ext = os.path.splitext(name)
-                    is_dir = entry.is_dir()
-                    rec = {
-                        "name": name,
-                        "stem": stem,
-                        "ext": ext[1:].lower(),
-                        "path": entry.path,
-                        "size": st.st_size,
-                        "mtime": st.st_mtime,
-                        "is_dir": is_dir,
-                    }
-                except OSError:
-                    # 权限不足、文件被占用或扫描期间已被删除：跳过这一项，
-                    # 不要让整个目录的扫描中断
-                    continue
-                (dirs if is_dir else files).append(rec)
-    except OSError:
-        # 目录本身不可读（如无权限）时返回空结果，由上层提示
-        pass
+    def build(entry):
+        """把一条目录项转成记录；失败时返回 None 而不是抛异常"""
+        try:
+            st = entry.stat()
+            name = entry.name
+            stem, ext = os.path.splitext(name)
+            return {
+                "name": name,
+                "stem": stem,
+                "ext": ext[1:].lower(),
+                "path": entry.path,
+                "rel": os.path.relpath(entry.path, directory),
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "is_dir": entry.is_dir(),
+            }
+        except OSError:
+            # 权限不足、文件被占用或扫描期间已被删除：跳过这一项，
+            # 不要让整个目录的扫描中断
+            return None
+
+    def consume(root_path, collect_dirs):
+        try:
+            with os.scandir(root_path) as it:
+                for entry in it:
+                    rec = build(entry)
+                    if rec is None:
+                        continue
+                    if rec["is_dir"]:
+                        if collect_dirs:
+                            dirs.append(rec)
+                    else:
+                        files.append(rec)
+        except OSError:
+            # 单个子目录不可读时只跳过它，不影响其余部分
+            pass
+
+    if recursive:
+        # onerror 兜底：遇到无权限目录时跳过而不是中断整次扫描
+        for root_path, subdirs, _ in os.walk(directory, onerror=lambda e: None):
+            # 排序保证遍历顺序稳定可复现（os.walk 默认顺序取决于文件系统）
+            subdirs.sort(key=natural_sort_key)
+            consume(root_path, collect_dirs=False)
+    else:
+        consume(directory, collect_dirs=True)
 
     return files, dirs
 
@@ -266,29 +290,38 @@ class FileListViewer:
         sort_combo.pack(side=tk.LEFT, padx=5)
         sort_combo.bind("<<ComboboxSelected>>", lambda event: self._redraw_list())
         
-        # 显示文件夹选项
+        # 第二行：扫描范围与显示选项
+        options_frame = ttk.Frame(actions_frame)
+        options_frame.pack(fill=tk.X, pady=(0, 5))
+
+        # 递归扫描：勾选后列出所有层级的文件，此时不再列出文件夹
+        self.recursive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="包含子文件夹",
+                        variable=self.recursive_var,
+                        command=self._toggle_recursive).pack(side=tk.LEFT, padx=5)
+
         self.folders_var = tk.BooleanVar(value=False)
-        folders_checkbox = ttk.Checkbutton(buttons_frame, text="显示文件夹", variable=self.folders_var, command=self._toggle_folders)
-        folders_checkbox.pack(side=tk.LEFT, padx=15)
+        self.folders_check = ttk.Checkbutton(options_frame, text="显示文件夹",
+                                             variable=self.folders_var,
+                                             command=self._toggle_folders)
+        self.folders_check.pack(side=tk.LEFT, padx=8)
 
-        # 第二行：可选显示字段。勾选后表格增加对应列，
-        # 复制与导出的内容同步跟随（多列时用制表符分隔）
-        fields_frame = ttk.Frame(actions_frame)
-        fields_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Separator(options_frame, orient='vertical').pack(
+            side=tk.LEFT, padx=10, fill=tk.Y)
 
-        ttk.Label(fields_frame, text="显示字段:",
+        ttk.Label(options_frame, text="显示字段:",
                   font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
 
         self.col_path_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fields_frame, text="完整路径", variable=self.col_path_var,
+        ttk.Checkbutton(options_frame, text="完整路径", variable=self.col_path_var,
                         command=self._redraw_list).pack(side=tk.LEFT, padx=8)
 
         self.col_size_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fields_frame, text="大小", variable=self.col_size_var,
+        ttk.Checkbutton(options_frame, text="大小", variable=self.col_size_var,
                         command=self._redraw_list).pack(side=tk.LEFT, padx=8)
 
         self.col_mtime_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fields_frame, text="修改时间", variable=self.col_mtime_var,
+        ttk.Checkbutton(options_frame, text="修改时间", variable=self.col_mtime_var,
                         command=self._redraw_list).pack(side=tk.LEFT, padx=8)
     
     def _browse_directory(self):
@@ -317,7 +350,8 @@ class FileListViewer:
             self.current_directory = directory
 
             # 扫描目录，一次性取回文件与文件夹记录（含大小、修改时间、完整路径）
-            self.files, self.dirs = scan_directory(directory)
+            self.files, self.dirs = scan_directory(directory,
+                                                   self.recursive_var.get())
             self.file_extensions = {r["ext"] for r in self.files if r["ext"]}
 
             # 更新文件类型下拉菜单
@@ -346,8 +380,14 @@ class FileListViewer:
         # 应用文件类型过滤
         filtered_files = self._filter_by_extension(self.files)
 
-        # 排序（自然排序：file2 排在 file10 之前）
-        filtered_files.sort(key=lambda r: natural_sort_key(r["name"]), reverse=reverse)
+        # 排序键跟随实际显示的第一列：递归时按相对路径排（读起来就是目录树的顺序），
+        # 否则按文件名排。若一律按文件名排，递归结果会按名字散落在不同目录间，
+        # 完全无法按层级阅读。
+        if self.recursive_var.get():
+            sort_key = lambda r: natural_sort_key(r["rel"])
+        else:
+            sort_key = lambda r: natural_sort_key(r["name"])
+        filtered_files.sort(key=sort_key, reverse=reverse)
 
         # 如果需要显示文件夹
         if self.show_folders:
@@ -385,7 +425,8 @@ class FileListViewer:
     def _cell_value(self, rec, key):
         """取出某条记录在指定列上的展示值"""
         if key == "name":
-            return rec["name"]
+            # 递归时改用相对路径：不同子目录下的同名文件必须能区分开
+            return rec["rel"] if self.recursive_var.get() else rec["name"]
         if key == "path":
             return rec["path"]
         if key == "size":
@@ -400,7 +441,11 @@ class FileListViewer:
         cols = self._active_columns()
         self.tree["columns"] = cols
         for key in cols:
-            title, width, anchor, stretch = COLUMN_META[key]
+            _, width, anchor, stretch = COLUMN_META[key]
+            # 递归时第一列内容变成相对路径，表头同步改名，避免文不对题
+            title = COLUMN_META[key][0]
+            if key == "name" and self.recursive_var.get():
+                title = "相对路径"
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=60,
                              anchor=anchor, stretch=stretch)
@@ -461,6 +506,22 @@ class FileListViewer:
         """切换是否显示文件夹（只重绘表格，不重新读磁盘）"""
         self.show_folders = self.folders_var.get()
         self._redraw_list()
+
+    def _toggle_recursive(self):
+        """切换是否递归扫描子文件夹。
+
+        递归模式下只列文件（层级由相对路径体现），「显示文件夹」随之失去意义，
+        因此一并置灰并取消勾选，避免出现「勾了却没反应」的困惑。
+
+        递归需要重新遍历整棵目录树，所以这里走完整的重新扫描，
+        而不是像 _toggle_folders 那样只重绘。
+        """
+        recursive = self.recursive_var.get()
+        if recursive:
+            self.show_folders = False
+            self.folders_var.set(False)
+        self.folders_check.state(["disabled"] if recursive else ["!disabled"])
+        self._refresh_file_list()
     
     def _get_current_directory(self):
         """实时从输入框取目录，作为复制/导出的唯一校验来源。
