@@ -2,6 +2,7 @@
 
 > 一键读取、复制、导出当前目录下的文件名 —— 面向 Windows 的轻量文件清单工具。
 
+[![CI](https://github.com/hongfei1993/dirlens/actions/workflows/build.yml/badge.svg)](https://github.com/hongfei1993/dirlens/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey.svg)]()
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)]()
@@ -84,6 +85,23 @@ pyinstaller --clean --noconfirm dirlens.spec
 ```
 
 产物：`dist/DirLens.exe`
+
+## 开发与测试
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+测试分两层：
+
+| 文件 | 覆盖内容 | 依赖 |
+|------|----------|------|
+| `tests/test_core.py` | 目录扫描、自然排序、大小与时间格式化 | 无（纯逻辑） |
+| `tests/test_gui.py` | 表格列、字段切换、筛选、递归、复制格式、状态栏 | 需要 Tk（窗口建在屏幕外） |
+
+每次推送到 `main` 或提交 Pull Request，GitHub Actions 都会自动跑一遍全部测试；
+推送 `v*` 标签时，测试通过后才会构建并发布 Release。
 
 ## 常见场景
 
