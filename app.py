@@ -192,7 +192,10 @@ class FileListViewer:
     def _setup_styles(self):
         # 配置UI样式
         self.style = ttk.Style()
-        self.style.theme_use("vista")
+        # 优先使用系统原生主题（勾选框等观感更贴近系统）。
+        # 不能直接写死 "vista"：该主题只在 Windows 上存在，其他平台调用会抛
+        # TclError 导致启动即崩。降级到跨平台通用的 clam。
+        self.style.theme_use("vista" if "vista" in self.style.theme_names() else "clam")
         
         # 统一按钮样式
         self.style.configure("TButton",
