@@ -151,7 +151,7 @@ class FileListViewer:
     def _setup_styles(self):
         # 配置UI样式
         self.style = ttk.Style()
-        self.style.theme_use("clam")
+        self.style.theme_use("vista")
         
         # 统一按钮样式
         self.style.configure("TButton",
