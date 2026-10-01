@@ -25,7 +25,23 @@ COLUMN_META = {
     "mtime": ("修改时间", 140, "w", False),
 }
 
+# 「复制格式」可选值。首项为默认：输出与表格当前显示的列完全一致
+OUTPUT_FORMATS = ("跟随列表", "仅文件名", "完整路径", "完整路径（带引号）", "逗号分隔")
+
 _SIZE_UNITS = ("B", "KB", "MB", "GB", "TB")
+
+
+def path_sort_key(value):
+    """文件路径 / 文件名的排序键。
+
+    先按「去掉扩展名后的自然顺序」比，再用完整名兜底。之所以要剥掉扩展名：
+    直接对完整名做自然排序会出现反直觉的结果 —— '报告.pdf' 整体是不含数字的
+    一段，而 '报告2.pdf' 会拆成 ['报告', 2, '.pdf']，比较时 '报告' 是
+    '报告.pdf' 的前缀，于是 '报告2.pdf' 反而排在前面。资源管理器的行为是
+    '报告.pdf' 在前，剥掉扩展名即可对齐。
+    """
+    stem, _ = os.path.splitext(value)
+    return (natural_sort_key(stem), natural_sort_key(value))
 
 
 def format_size(num):
@@ -137,6 +153,7 @@ class FileListViewer:
         self.dirs = []
         self.file_extensions = set()  # 当前目录出现过的扩展名（小写、无点号）
         self.show_folders = False  # 是否显示文件夹
+        self._keyword_job = None   # 关键词过滤的节流句柄（见 _on_keyword_change）
         
         # 创建主框架
         self.main_frame = ttk.Frame(root, padding="10")
@@ -276,19 +293,30 @@ class FileListViewer:
         separator = ttk.Separator(buttons_frame, orient='vertical')
         separator.pack(side=tk.LEFT, padx=10, fill=tk.Y)
         
-        # 过滤功能
-        ttk.Label(buttons_frame, text="文件类型:", font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
-        self.filter_var = tk.StringVar(value="所有文件")
-        self.filter_combo = ttk.Combobox(buttons_frame, textvariable=self.filter_var, width=12, state="readonly")
-        self.filter_combo.pack(side=tk.LEFT, padx=5)
-        self.filter_combo.bind("<<ComboboxSelected>>", lambda event: self._apply_filter())
-        
-        # 排序功能
-        ttk.Label(buttons_frame, text="排序:", font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
-        self.sort_var = tk.StringVar(value="升序")
-        sort_combo = ttk.Combobox(buttons_frame, textvariable=self.sort_var, values=["升序", "降序"], width=6, state="readonly")
-        sort_combo.pack(side=tk.LEFT, padx=5)
-        sort_combo.bind("<<ComboboxSelected>>", lambda event: self._redraw_list())
+        # 复制 / 导出格式。默认"跟随列表"，即输出与表格当前显示的列完全一致
+        ttk.Label(buttons_frame, text="复制格式:",
+                  font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
+        self.copy_format_var = tk.StringVar(value=OUTPUT_FORMATS[0])
+        fmt_combo = ttk.Combobox(buttons_frame, textvariable=self.copy_format_var,
+                                 values=OUTPUT_FORMATS, width=17, state="readonly")
+        fmt_combo.pack(side=tk.LEFT, padx=5)
+
+        # 过滤：文件类型（支持多选）。选项在每次扫描后按实际出现的扩展名重建
+        ttk.Label(buttons_frame, text="文件类型:",
+                  font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
+        self.filter_btn = ttk.Menubutton(buttons_frame, text="所有文件", width=13)
+        self.filter_btn.pack(side=tk.LEFT, padx=5)
+        self.filter_menu = tk.Menu(self.filter_btn, tearoff=0)
+        self.filter_btn["menu"] = self.filter_menu
+        self.filter_vars = {}          # 扩展名 -> BooleanVar
+
+        # 过滤：文件名关键词，输入即过滤（带节流，见 _on_keyword_change）
+        ttk.Label(buttons_frame, text="关键词:",
+                  font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
+        self.keyword_var = tk.StringVar()
+        keyword_entry = ttk.Entry(buttons_frame, textvariable=self.keyword_var, width=16)
+        keyword_entry.pack(side=tk.LEFT, padx=5)
+        keyword_entry.bind("<KeyRelease>", self._on_keyword_change)
         
         # 第二行：扫描范围与显示选项
         options_frame = ttk.Frame(actions_frame)
@@ -305,6 +333,15 @@ class FileListViewer:
                                              variable=self.folders_var,
                                              command=self._toggle_folders)
         self.folders_check.pack(side=tk.LEFT, padx=8)
+
+        # 排序（由第一行移到这里，为关键词输入框腾出横向空间）
+        ttk.Label(options_frame, text="排序:",
+                  font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=(5, 0))
+        self.sort_var = tk.StringVar(value="升序")
+        sort_combo = ttk.Combobox(options_frame, textvariable=self.sort_var,
+                                  values=["升序", "降序"], width=6, state="readonly")
+        sort_combo.pack(side=tk.LEFT, padx=5)
+        sort_combo.bind("<<ComboboxSelected>>", lambda event: self._redraw_list())
 
         ttk.Separator(options_frame, orient='vertical').pack(
             side=tk.LEFT, padx=10, fill=tk.Y)
@@ -352,17 +389,12 @@ class FileListViewer:
             # 扫描目录，一次性取回文件与文件夹记录（含大小、修改时间、完整路径）
             self.files, self.dirs = scan_directory(directory,
                                                    self.recursive_var.get())
-            self.file_extensions = {r["ext"] for r in self.files if r["ext"]}
+            # 这里保留空串（无扩展名的文件，如 README / LICENSE），
+            # 让「全选」能覆盖到它们，避免"点了全选反而少了几行"的困惑
+            self.file_extensions = {r["ext"] for r in self.files}
 
-            # 更新文件类型下拉菜单
-            if hasattr(self, 'filter_combo'):
-                extensions = sorted(self.file_extensions)
-                filter_options = ["所有文件"] + extensions
-                self.filter_combo['values'] = filter_options
-                # 如果当前选择的扩展名不在列表中，重置为"所有文件"
-                current_filter = self.filter_var.get()
-                if current_filter != "所有文件" and current_filter not in extensions:
-                    self.filter_var.set("所有文件")
+            # 按当前目录实际出现的扩展名重建类型多选菜单
+            self._rebuild_filter_menu()
             
             # 重绘表格与状态栏
             self._redraw_list()
@@ -377,39 +409,53 @@ class FileListViewer:
         sort_order = self.sort_var.get() if hasattr(self, 'sort_var') else "升序"
         reverse = (sort_order == "降序")
 
-        # 应用文件类型过滤
-        filtered_files = self._filter_by_extension(self.files)
+        # 应用关键词与扩展名过滤
+        filtered_files = self._filter_records(self.files)
 
         # 排序键跟随实际显示的第一列：递归时按相对路径排（读起来就是目录树的顺序），
         # 否则按文件名排。若一律按文件名排，递归结果会按名字散落在不同目录间，
         # 完全无法按层级阅读。
         if self.recursive_var.get():
-            sort_key = lambda r: natural_sort_key(r["rel"])
+            sort_key = lambda r: path_sort_key(r["rel"])
         else:
-            sort_key = lambda r: natural_sort_key(r["name"])
+            sort_key = lambda r: path_sort_key(r["name"])
         filtered_files.sort(key=sort_key, reverse=reverse)
 
         # 如果需要显示文件夹
         if self.show_folders:
             sorted_dirs = sorted(self.dirs,
-                                 key=lambda r: natural_sort_key(r["name"]),
+                                 key=lambda r: path_sort_key(r["name"]),
                                  reverse=reverse)
             # 文件夹和文件分开显示
             return sorted_dirs + filtered_files
         else:
             return filtered_files
 
-    def _filter_by_extension(self, records):
-        """按扩展名过滤文件记录"""
-        if not hasattr(self, 'filter_var'):
+    def _selected_extensions(self):
+        """当前选中的扩展名集合；空集表示不限类型"""
+        return {ext for ext, var in self.filter_vars.items() if var.get()}
+
+    def _filter_records(self, records):
+        """按关键词与扩展名过滤文件记录。
+
+        两个条件是「且」的关系，都未设置时原样返回。
+        关键词同时匹配文件名与相对路径（递归模式下可用来筛某个子目录）；
+        中间用 \n 拼接，避免关键词恰好横跨两段产生误匹配。
+        """
+        exts = self._selected_extensions()
+        keyword = self.keyword_var.get().strip().lower()
+
+        if not exts and not keyword:
             return records
 
-        selected_type = self.filter_var.get()
-        if selected_type == "所有文件":
-            return records
-
-        target = selected_type.lower()
-        return [r for r in records if r["ext"] == target]
+        result = []
+        for r in records:
+            if exts and r["ext"] not in exts:
+                continue
+            if keyword and keyword not in (r["name"] + "\n" + r["rel"]).lower():
+                continue
+            result.append(r)
+        return result
 
     def _active_columns(self):
         """当前启用的列。文件名始终显示，其余列由勾选框决定。"""
@@ -489,18 +535,88 @@ class FileListViewer:
     def _output_lines(self, records):
         """把记录列表转成待输出的文本行（复制与导出共用）。
 
-        规则：输出完全跟随界面显示 —— 只看文件名时每行一个名称（与旧行为一致）；
-        勾选了额外字段时用制表符分列，便于直接粘贴进 Excel / WPS。
+        默认「跟随列表」：输出与表格当前显示的列完全一致 —— 只看文件名时每行一个
+        名称；勾选了额外字段时用制表符分列，可直接粘进 Excel / WPS。
+        （单列时 \t 拼接不会产生制表符，行为与旧版一致。）
+
+        其余格式则覆盖列设置，直接输出指定形态。
         """
-        cols = self._active_columns()
-        if cols == ["name"]:
+        fmt = self.copy_format_var.get()
+
+        if fmt == "仅文件名":
             return [r["name"] for r in records]
+        if fmt == "完整路径":
+            return [r["path"] for r in records]
+        if fmt == "完整路径（带引号）":
+            # Windows 路径常含空格，贴进命令行时必须有引号
+            return ['"%s"' % r["path"] for r in records]
+        if fmt == "逗号分隔":
+            # 单行输出，便于贴进聊天窗口或表格的单个单元格
+            return [", ".join(r["name"] for r in records)]
+
+        # 跟随列表
+        cols = self._active_columns()
         return ["\t".join(self._cell_value(r, k) for k in cols)
                 for r in records]
     
-    def _apply_filter(self):
-        """应用过滤条件（只重绘表格，不重新读磁盘）"""
+    def _rebuild_filter_menu(self):
+        """按当前目录实际出现的扩展名重建「文件类型」多选菜单。
+
+        重建时保留上一次已勾选的扩展名，避免刷新或切换目录后选择被清空。
+        """
+        previously = self._selected_extensions()
+
+        self.filter_menu.delete(0, tk.END)
+        self.filter_menu.add_command(label="全选",
+                                     command=lambda: self._set_all_extensions(True))
+        self.filter_menu.add_command(label="清除选择",
+                                     command=lambda: self._set_all_extensions(False))
+
+        exts = sorted(self.file_extensions, key=natural_sort_key)
+        self.filter_vars = {}
+        if exts:
+            self.filter_menu.add_separator()
+            for ext in exts:
+                var = tk.BooleanVar(value=(ext in previously))
+                self.filter_vars[ext] = var
+                self.filter_menu.add_checkbutton(
+                    label=ext if ext else "（无扩展名）",
+                    variable=var,
+                    command=self._on_filter_changed)
+
+        self._update_filter_button()
+
+    def _set_all_extensions(self, value):
+        """一键全选 / 清除全部类型"""
+        for var in self.filter_vars.values():
+            var.set(value)
+        self._on_filter_changed()
+
+    def _update_filter_button(self):
+        """按钮文字反映当前选择：不限 / 单个类型 / 已选 N 种"""
+        selected = self._selected_extensions()
+        if not selected:
+            text = "所有文件"
+        elif len(selected) == 1:
+            text = next(iter(selected))
+        else:
+            text = "已选 %d 种" % len(selected)
+        self.filter_btn.configure(text=text)
+
+    def _on_filter_changed(self):
+        """类型选择变化：更新按钮文字并重绘表格"""
+        self._update_filter_button()
         self._redraw_list()
+
+    def _on_keyword_change(self, event=None):
+        """关键词输入：节流后再重绘。
+
+        逐字触发会在大目录下反复重建整张表格，因此用 after 合并连续输入，
+        只在停止输入约 200ms 后真正过滤一次。
+        """
+        if self._keyword_job is not None:
+            self.root.after_cancel(self._keyword_job)
+        self._keyword_job = self.root.after(200, self._redraw_list)
 
     def _toggle_folders(self):
         """切换是否显示文件夹（只重绘表格，不重新读磁盘）"""
