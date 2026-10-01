@@ -3,10 +3,9 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import re
 import sys
-import pyperclip
+from datetime import datetime
 
-# 导入ScrolledText组件
-from tkinter.scrolledtext import ScrolledText
+import pyperclip
 
 
 def natural_sort_key(text):
@@ -17,6 +16,36 @@ def natural_sort_key(text):
     """
     return [int(part) if part.isdigit() else part.lower()
             for part in re.split(r'(\d+)', text)]
+
+
+COLUMN_META = {
+    "name":  ("文件名",   320, "w", True),
+    "path":  ("完整路径", 380, "w", True),
+    "size":  ("大小",      90, "e", False),
+    "mtime": ("修改时间", 140, "w", False),
+}
+
+_SIZE_UNITS = ("B", "KB", "MB", "GB", "TB")
+
+
+def format_size(num):
+    """把字节数转成人类可读形式，例如 1536 -> '1.5 KB'"""
+    if num < 1024:
+        return f"{num} B"
+    value = float(num)
+    for unit in _SIZE_UNITS[1:]:
+        value /= 1024.0
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} {_SIZE_UNITS[-1]}"
+
+
+def format_mtime(timestamp):
+    """把时间戳转成本地时间的可读字符串；时间异常时返回占位符而不是抛异常"""
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return "-"
 
 
 def scan_directory(directory):
@@ -51,6 +80,7 @@ def scan_directory(directory):
                         "path": entry.path,
                         "size": st.st_size,
                         "mtime": st.st_mtime,
+                        "is_dir": is_dir,
                     }
                 except OSError:
                     # 权限不足、文件被占用或扫描期间已被删除：跳过这一项，
@@ -133,6 +163,15 @@ class FileListViewer:
         self.style.map("TButton",
                       foreground=[('pressed', 'black'), ('active', 'blue')],
                       background=[('pressed', '!disabled', '#d9d9d9'), ('active', '#e6e6e6')])
+
+        # 表格样式：中文字体与合适的行高
+        self.style.configure("Treeview",
+                            font=("Microsoft YaHei UI", 10),
+                            rowheight=24,
+                            background="white",
+                            fieldbackground="white")
+        self.style.configure("Treeview.Heading",
+                            font=("Microsoft YaHei UI", 10))
     
     def _create_directory_section(self):
         directory_frame = ttk.LabelFrame(self.main_frame, text="目录选择", padding="10")
@@ -156,18 +195,22 @@ class FileListViewer:
         list_frame = ttk.LabelFrame(self.main_frame, text="文件列表", padding="10")
         list_frame.pack(fill=tk.BOTH, expand=True, pady=5, ipady=5)
         
-        # 创建滚动文本框 - 使用更现代的样式
-        self.file_list_text = ScrolledText(list_frame, 
-                                          font=("Microsoft YaHei UI", 10), 
-                                          wrap=tk.NONE,
-                                          bg="white",
-                                          bd=1,
-                                          relief=tk.SUNKEN,
-                                          highlightthickness=1,
-                                          highlightbackground="#CCCCCC",
-                                          insertbackground="#000000")
-        self.file_list_text.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        self.file_list_text.config(state=tk.DISABLED)
+        # 文件列表改用 Treeview 表格：原生支持多列、表头与选中，
+        # 也是后续「字段可选」「勾选部分文件」等功能的基础。
+        tree_area = ttk.Frame(list_frame)
+        tree_area.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        self.tree = ttk.Treeview(tree_area, columns=(), show="headings",
+                                 selectmode="extended")
+        vbar = ttk.Scrollbar(tree_area, orient=tk.VERTICAL, command=self.tree.yview)
+        hbar = ttk.Scrollbar(tree_area, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        tree_area.rowconfigure(0, weight=1)
+        tree_area.columnconfigure(0, weight=1)
         
         
         
@@ -217,12 +260,32 @@ class FileListViewer:
         self.sort_var = tk.StringVar(value="升序")
         sort_combo = ttk.Combobox(buttons_frame, textvariable=self.sort_var, values=["升序", "降序"], width=6, state="readonly")
         sort_combo.pack(side=tk.LEFT, padx=5)
-        sort_combo.bind("<<ComboboxSelected>>", lambda event: self._refresh_file_list())
+        sort_combo.bind("<<ComboboxSelected>>", lambda event: self._redraw_list())
         
         # 显示文件夹选项
         self.folders_var = tk.BooleanVar(value=False)
         folders_checkbox = ttk.Checkbutton(buttons_frame, text="显示文件夹", variable=self.folders_var, command=self._toggle_folders)
         folders_checkbox.pack(side=tk.LEFT, padx=15)
+
+        # 第二行：可选显示字段。勾选后表格增加对应列，
+        # 复制与导出的内容同步跟随（多列时用制表符分隔）
+        fields_frame = ttk.Frame(actions_frame)
+        fields_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(fields_frame, text="显示字段:",
+                  font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
+
+        self.col_path_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fields_frame, text="完整路径", variable=self.col_path_var,
+                        command=self._redraw_list).pack(side=tk.LEFT, padx=8)
+
+        self.col_size_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fields_frame, text="大小", variable=self.col_size_var,
+                        command=self._redraw_list).pack(side=tk.LEFT, padx=8)
+
+        self.col_mtime_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fields_frame, text="修改时间", variable=self.col_mtime_var,
+                        command=self._redraw_list).pack(side=tk.LEFT, padx=8)
     
     def _browse_directory(self):
         directory = filedialog.askdirectory()
@@ -263,26 +326,8 @@ class FileListViewer:
                 if current_filter != "所有文件" and current_filter not in extensions:
                     self.filter_var.set("所有文件")
             
-            # 获取需要显示的项目
-            items_to_display = self._get_items_to_display()
-            
-            # 清空文本框
-            self.file_list_text.config(state=tk.NORMAL)
-            self.file_list_text.delete(1.0, tk.END)
-            
-            # 显示项目
-            if items_to_display:
-                for rec in items_to_display:
-                    self.file_list_text.insert(tk.END, self._item_text(rec) + "\n")
-                # 更新状态
-                total_count = len(self.files) + (len(self.dirs) if self.show_folders else 0)
-                self.status_var.set(f"找到 {total_count} 个项目")
-            else:
-                self.file_list_text.insert(tk.END, "没有找到符合条件的项目")
-                total_count = len(self.files) + (len(self.dirs) if self.show_folders else 0)
-                self.status_var.set(f"找到 {total_count} 个项目，过滤后显示 0 个")
-            
-            self.file_list_text.config(state=tk.DISABLED)
+            # 重绘表格与状态栏
+            self._redraw_list()
             
         except Exception as e:
             messagebox.showerror("错误", f"加载文件列表时出错：{str(e)}")
@@ -322,25 +367,96 @@ class FileListViewer:
         target = selected_type.lower()
         return [r for r in records if r["ext"] == target]
 
-    def _item_text(self, rec):
-        """单个条目在当前设置下的输出文本。
+    def _active_columns(self):
+        """当前启用的列。文件名始终显示，其余列由勾选框决定。"""
+        cols = ["name"]
+        if self.col_path_var.get():
+            cols.append("path")
+        if self.col_size_var.get():
+            cols.append("size")
+        if self.col_mtime_var.get():
+            cols.append("mtime")
+        return cols
 
-        显示、复制、导出三处共用；后续加入「完整路径」等字段时改这里即可。
+    def _cell_value(self, rec, key):
+        """取出某条记录在指定列上的展示值"""
+        if key == "name":
+            return rec["name"]
+        if key == "path":
+            return rec["path"]
+        if key == "size":
+            # 文件夹不统计大小（目录的 st_size 在 Windows 上恒为 0，显示"0 B"会误导）
+            return "-" if rec.get("is_dir") else format_size(rec["size"])
+        if key == "mtime":
+            return format_mtime(rec["mtime"])
+        return ""
+
+    def _rebuild_tree_columns(self):
+        """按当前启用的列重建表头"""
+        cols = self._active_columns()
+        self.tree["columns"] = cols
+        for key in cols:
+            title, width, anchor, stretch = COLUMN_META[key]
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, minwidth=60,
+                             anchor=anchor, stretch=stretch)
+
+    def _redraw_list(self):
+        """用已扫描到的记录重绘表格与状态栏（不重新读取磁盘）。
+
+        过滤、排序、切换字段、显示文件夹等操作都走这里，
+        避免每次操作都重新扫描一遍目录。
         """
-        return rec["name"]
+        self._rebuild_tree_columns()
+
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        records = self._get_items_to_display()
+        cols = self._active_columns()
+
+        if records:
+            for rec in records:
+                self.tree.insert("", tk.END,
+                                 values=[self._cell_value(rec, k) for k in cols])
+        else:
+            # 空结果时占位，避免出现一片空白让人以为程序坏了
+            self.tree.insert("", tk.END,
+                             values=["（没有符合条件的项目）"] + [""] * (len(cols) - 1))
+
+        self._update_status(len(records))
+
+    def _update_status(self, shown_count):
+        """更新状态栏：项目总数、文件数、合计大小"""
+        total = len(self.files) + (len(self.dirs) if self.show_folders else 0)
+        text = f"找到 {total} 个项目"
+        if self.files:
+            total_size = sum(r["size"] for r in self.files)
+            text += f"（文件 {len(self.files)} 个，合计 {format_size(total_size)}）"
+        if shown_count != total:
+            text += f"，过滤后显示 {shown_count} 个"
+        self.status_var.set(text)
+
+    def _output_lines(self, records):
+        """把记录列表转成待输出的文本行（复制与导出共用）。
+
+        规则：输出完全跟随界面显示 —— 只看文件名时每行一个名称（与旧行为一致）；
+        勾选了额外字段时用制表符分列，便于直接粘贴进 Excel / WPS。
+        """
+        cols = self._active_columns()
+        if cols == ["name"]:
+            return [r["name"] for r in records]
+        return ["\t".join(self._cell_value(r, k) for k in cols)
+                for r in records]
     
     def _apply_filter(self):
-        """应用过滤条件"""
-        directory = self.directory_var.get().strip()
-        if directory and os.path.isdir(directory):
-            self._load_file_list(directory)
-    
+        """应用过滤条件（只重绘表格，不重新读磁盘）"""
+        self._redraw_list()
+
     def _toggle_folders(self):
-        """切换是否显示文件夹"""
+        """切换是否显示文件夹（只重绘表格，不重新读磁盘）"""
         self.show_folders = self.folders_var.get()
-        directory = self.directory_var.get().strip()
-        if directory and os.path.isdir(directory):
-            self._load_file_list(directory)
+        self._redraw_list()
     
     def _get_current_directory(self):
         """实时从输入框取目录，作为复制/导出的唯一校验来源。
@@ -367,7 +483,7 @@ class FileListViewer:
                 return
             
             # 生成所有项目的文本
-            items_text = "\n".join(self._item_text(rec) for rec in items_to_copy)
+            items_text = "\n".join(self._output_lines(items_to_copy))
             pyperclip.copy(items_text)
             
             item_type = "文件名和文件夹" if self.show_folders else "文件名"
@@ -403,8 +519,8 @@ class FileListViewer:
             # 用 utf-8-sig（带 BOM）：国内用户多用 Excel/WPS 双击打开导出的 txt，
             # 无 BOM 的 UTF-8 会被识别成 ANSI，导致中文文件名乱码
             with open(file_path, 'w', encoding='utf-8-sig') as f:
-                for rec in items_to_export:
-                    f.write(self._item_text(rec) + "\n")
+                for line in self._output_lines(items_to_export):
+                    f.write(line + "\n")
             
             item_type = "文件名和文件夹" if self.show_folders else "文件名"
             messagebox.showinfo("成功", f"已成功导出 {len(items_to_export)} 个{item_type}到文件\n{file_path}")
